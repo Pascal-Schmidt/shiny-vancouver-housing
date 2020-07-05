@@ -1,0 +1,13 @@
+name: vancouver-housing
+title: vancouver-housing
+username:
+account: pascalschmidt
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 2392718
+bundleId: 3263892
+url: https://pascalschmidt.shinyapps.io/vancouver-housing/
+when: 1592011282.1313
+asMultiple: FALSE
+asStatic: FALSE
+ignoredFiles: shapefiles/local-area-boundary.dbf|shapefiles/local-area-boundary.prj|shapefiles/local-area-boundary.shp|shapefiles/local-area-boundary.shx

@@ -1,0 +1,236 @@
+---
+title: "Analysis Hosuing Data"
+author: "Pascal Schmidt"
+date: "May 13, 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(doParallel)
+```
+
+```{r}
+df <- readr::read_csv("final.csv") %>%
+  dplyr::mutate(website = ifelse(data %in% c("craigslist", "liv_rent", "rentals"),
+                                 "rental", "buying"))
+
+df %>% 
+  dplyr::mutate(furnished = ifelse(
+    stringr::str_detect(furnished,
+                        "(\\bfurnish\\b|\\bfurnished\\b|\\bbedroomfurnishedprivate\\b|
+                        \\bbedroomunfurnish\\b|\\bbedroomfurnish\\b)"), 
+    "furnished", furnished)
+  ) %>%
+  dplyr::mutate(furnished = ifelse(
+    stringr::str_detect(furnished,
+                        "unfurnished|bedroom"), 
+    "unfurnished", furnished)
+  ) -> df
+```
+
+```{r}
+# split into rentals and and buying
+df_rentals <- df %>%
+  dplyr::filter(website == "rental") %>%
+  dplyr::select(-c(ID, postal_code, strata, taxes, data, description,
+                   lot_size, website, geometry, mapid, address, neighborhood)) %>%
+  na.omit() %>%
+  dplyr::filter(price > 400) %>%
+  dplyr::filter(bath < 10)
+
+df_homes <- df %>%
+  dplyr::filter(website == "buying") %>%
+  dplyr::select(-c(ID, postal_code, strata, data, lot_size, website, taxes, 
+                   geometry, mapid, address, neighborhood, description)) %>%
+  na.omit() %>%
+  dplyr::mutate(price = sqrt(price))
+```
+
+```{r}
+# split data set into training and testing data set 
+homes_split <- rsample::initial_split(df_homes)
+
+# extract training split
+homes_training <- rsample::training(homes_split)
+
+# extract testing split
+homes_testing <- rsample::testing(homes_split)
+
+# do five fold cross validation on hosuing data to find good
+# hyperparameters for random forest
+homes_folds <- rsample::vfold_cv(homes_training, v = 10)
+
+#----------------------------------------------------------------------
+#----------------------------------------------------------------------
+#----------------------------------------------------------------------
+
+
+# split data set into training and testing data set 
+rentals_split <- rsample::initial_split(df_rentals)
+
+# extract training split
+rentals_training <- rsample::training(rentals_split)
+
+# extract testing split
+rentals_testing <- rsample::testing(rentals_split)
+
+# do five fold cross validation on hosuing data to find good
+# hyperparameters for random forest
+rentals_folds <- rsample::vfold_cv(rentals_training, v = 10)
+```
+
+```{r}
+ml_fun <- function(df, folds_n, mtry_n = NULL, min_n_n = NULL) {
+  
+  # split data set into training and testing data set 
+  split <- rsample::initial_split(df)
+  
+  # extract training split
+  training <- rsample::training(split)
+  
+  # extract testing split
+  testing <- rsample::testing(split)
+  
+  # do five fold cross validation on hosuing data to find good
+  # hyperparameters for random forest
+  folds <- rsample::vfold_cv(training, v = folds_n)
+  
+  # data pre-processing
+  rec <- recipes::recipe(price ~ ., data = training) %>%
+    
+    # dummy variables for categorical variables
+    recipes::step_dummy(recipes::all_nominal())
+  
+  
+  # model specification, fit lasso model (mixture = 1) 
+  # and cross validate for best penalty
+  rf_spec <- parsnip::rand_forest(
+    mtry = tune::tune(),
+    trees = 1000,
+    min_n = tune::tune()
+  ) %>%
+    parsnip::set_mode("regression") %>%
+    parsnip::set_engine("ranger") 
+  
+  # combine model and pre-processing recipe
+  wf <- workflows::workflow() %>%
+    workflows::add_recipe(rec) %>%
+    workflows::add_model(rf_spec)
+  
+  if(!is.null(mtry_n)) {
+    
+    # more focused grid values
+    rf_grid <- dials::grid_regular(
+      mtry(range = mtry_n),
+      min_n(range = min_n_n),
+      levels = 5
+    )
+    
+    # register four cores for parallel computing
+    doParallel::registerDoParallel(4)
+    
+    # get best model from more focused grid
+    regular_res <- wf %>%
+      tune::tune_grid(
+        resamples = folds,
+        grid = rf_grid
+      )
+    
+    regular_res %>%
+      tune::collect_metrics() %>%
+      dplyr::filter(.metric == "rsq") %>%
+      dplyr::arrange(mean) %>%
+      .[1, ] %>%
+      dplyr::select(mtry, min_n) -> best_hyper
+    
+    tune::finalize_model(
+      rf_spec,
+      best_hyper
+    ) -> final_rf
+    
+    final_wf <- workflows::workflow() %>%
+      workflows::add_recipe(rec) %>%
+      workflows::add_model(final_rf)
+    
+    return(final_wf)
+    
+  } else {
+    
+    # register four cores for parallel computing
+    doParallel::registerDoParallel(4)
+    
+    # compute best number of variables in model
+    # and nodes to split on 
+    res <- wf %>%
+      tune::tune_grid(resamples = folds,
+                      grid = 25,
+                      metrics = yardstick::metric_set(yardstick::rsq,
+                                                      yardstick::mae))
+    
+    res %>%
+      collect_metrics() %>%
+      filter(.metric == "rsq") %>%
+      select(mean, min_n, mtry) %>%
+      pivot_longer(min_n:mtry,
+                   values_to = "value",
+                   names_to = "parameter"
+      ) %>%
+      ggplot(aes(value, mean, color = parameter)) +
+      geom_point(show.legend = FALSE) +
+      facet_wrap(~parameter, scales = "free_x") +
+      labs(x = NULL, y = "R Squared") -> gg_plot
+    
+    return(gg_plot)
+    
+  }
+  
+}
+
+plot <- ml_fun(df = df_homes, folds_n = 10)
+homes_rf <- ml_fun(df = df_homes, folds_n = 10, mtry = c(20, 35), min_n = c(1, 12))
+
+split <- rsample::initial_split(df_homes)
+x <- homes_rf %>%
+  tune::last_fit(split,
+                 metrics = yardstick::metric_set(yardstick::rsq,
+                                                 yardstick::mae,
+                                                 yardstick::rmse)) 
+
+x$.predictions %>%
+  .[[1]] %>%
+  dplyr::mutate_at(vars(price, .pred), ~ .^2) %>%
+  dplyr::mutate(mae = sum(abs(.pred - price)) / nrow(.))
+
+saveRDS(homes_rf, "homes_rf.rds")
+beepr::beep()
+
+plot_1 <- ml_fun(df = df_rentals, folds_n = 10)
+rentals_rf <- ml_fun(df = df_rentals, folds_n = 10, mtry = c(10, 35), min_n = c(1, 12))
+
+split <- rsample::initial_split(df_rentals)
+y <- rentals_rf %>%
+  tune::last_fit(split,
+                 metrics = yardstick::metric_set(yardstick::rsq,
+                                                 yardstick::mae,
+                                                 yardstick::rmse)) 
+
+y$.predictions %>%
+y$.metrics
+
+saveRDS(rentals_rf, "rentals_rf.rds")
+```
+
+
+
+
+
+
+
+
+

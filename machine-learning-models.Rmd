@@ -1,0 +1,367 @@
+---
+title: "Analysis Hosuing Data"
+author: "Pascal Schmidt"
+date: "May 13, 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(doParallel)
+library(ranger)
+```
+
+```{r}
+df <- readr::read_csv("final.csv") %>% 
+  dplyr::mutate(website = ifelse(website %in% c("craigslist", "liv_rent", "rentals", "fast_rental"),
+                                 "rental", "buying")) %>%
+  dplyr::filter(type != "land/lot") %>%
+  dplyr::mutate(type = dplyr::case_when(type == "multi" ~ "house",
+                                        type == "multifamily" ~ "house",
+                                        type == "partial house" ~ "house",
+                                        type == "studio" ~ "condo",
+                                        TRUE ~ as.character(type))) %>%
+  dplyr::filter_at(vars(lat, lon, bed, bath, sqft), all_vars(!is.na(.)))
+```
+
+```{r}
+# split into rentals and buying
+df_rentals <- df %>%
+  dplyr::filter(website == "rental") 
+
+# check for weird outliers in data frame
+df_rentals %>%
+  purrr::map_dfr(~ range(.))
+
+# removes houses with missing (unrealistic) year_built values
+df_rentals <- df_rentals[which(df_rentals$bed < 10), ]
+
+# remove houses that cost more than 10 million
+df_rentals <- df_rentals[which(df_rentals$price > 300), ] 
+
+# remove square feet that are too low 
+df_rentals <- df_rentals[which(df_rentals$sqft > 50), ] 
+
+# check for weird outliers in data frame
+df_rentals %>%
+  purrr::map_dfr(~ range(.))
+
+df_rentals_anno <- df_rentals %>%
+  dplyr::mutate(ID = dplyr::row_number()) %>%
+  dplyr::select(postal_code, url, description, mapid, address, geometry, year_built, website)
+  
+df_rentals <- df_rentals %>%
+  dplyr::mutate(ID = dplyr::row_number()) %>%
+  dplyr::select(-c(postal_code, url, description, mapid, address, geometry, year_built, website))
+```
+
+```{r}
+df_homes <- df %>%
+  dplyr::filter(website == "buying")
+
+# check for weird outliers in data frame
+df_homes %>%
+  purrr::map_dfr(~ range(.))
+
+# removes houses with missing (unrealistic) year_built values
+df_homes <- df_homes[which(df_homes$year_built < 2030), ]
+
+# remove houses that cost more than 10 million
+df_homes <- df_homes[which(df_homes$price < 10000001), ]
+
+# remove square feet that are too low 
+df_homes <- df_homes[which(df_homes$sqft > 100), ]
+
+df_homes %>%
+  dplyr::mutate(price = sqrt(price)) -> df_homes
+
+df_homes_anno <- df_homes %>%
+  dplyr::mutate(ID = dplyr::row_number()) %>%
+  dplyr::select(postal_code, url, description, mapid, address, geometry, furnished, website)
+
+df_homes <- df_homes %>%
+  dplyr::mutate(ID = dplyr::row_number()) %>%
+  dplyr::select(-c(postal_code, url, description, mapid, address, geometry, furnished, website)) 
+```
+
+### Random Forest 
+
+```{r}
+# register four cores for parallel computing
+doParallel::registerDoParallel(4)
+
+ml_fun <- function(df, folds_n, mtry_n = NULL, min_n_n = NULL) {
+  
+  # split data set into training and testing data set 
+  set.seed(1)
+  split <- rsample::initial_split(df)
+  
+  set.seed(2)
+  # extract training split
+  training <- rsample::training(split)
+  
+  set.seed(3)
+  # extract testing split
+  testing <- rsample::testing(split)
+  
+  # do five fold cross validation on hosuing data to find good
+  # hyperparameters for random forest
+  set.seed(4)
+  folds <- rsample::vfold_cv(training, v = folds_n)
+  
+  # data pre-processing
+  rec <- recipes::recipe(price ~ ., data = training) %>%
+    
+    recipes::update_role(ID, new_role = "id variable") %>%
+    
+    # dummy variables for categorical variables
+    recipes::step_dummy(recipes::all_nominal())
+  
+  
+  # model specification, fit lasso model (mixture = 1) 
+  # and cross validate for best penalty
+  set.seed(5)
+  rf_spec <- parsnip::rand_forest(
+    mtry = tune::tune(),
+    trees = 1000,
+    min_n = tune::tune()
+  ) %>%
+    parsnip::set_mode("regression") %>%
+    parsnip::set_engine("ranger") 
+  
+  # combine model and pre-processing recipe
+  wf <- workflows::workflow() %>%
+    workflows::add_recipe(rec) %>%
+    workflows::add_model(rf_spec)
+  
+  if(!is.null(mtry_n)) {
+    
+    # more focused grid values
+    set.seed(7)
+    rf_grid <- dials::grid_regular(
+      mtry(range = mtry_n),
+      min_n(range = min_n_n),
+      levels = 5
+    )
+    
+    # register four cores for parallel computing
+    doParallel::registerDoParallel(4)
+    
+    # get best model from more focused grid
+    set.seed(8)
+    regular_res <- wf %>%
+      tune::tune_grid(
+        resamples = folds,
+        grid = rf_grid
+      )
+    
+    regular_res %>%
+      tune::collect_metrics() %>%
+      dplyr::filter(.metric == "rsq") %>%
+      dplyr::arrange(mean) %>%
+      .[1, ] %>%
+      dplyr::select(mtry, min_n) -> best_hyper
+    
+    tune::finalize_model(
+      rf_spec,
+      best_hyper
+    ) -> final_rf
+    
+    final_wf <- workflows::workflow() %>%
+      workflows::add_recipe(rec) %>%
+      workflows::add_model(final_rf)
+    
+    final_model <- final_wf %>%
+      parsnip::fit(data = training)
+    
+    return(final_model)
+    
+  } else {
+    
+    # register four cores for parallel computing
+    doParallel::registerDoParallel(4)
+    
+    # compute best number of variables in model
+    # and nodes to split on 
+    set.seed(9)
+    res <- wf %>%
+      tune::tune_grid(resamples = folds,
+                      grid = 15,
+                      metrics = yardstick::metric_set(yardstick::rsq,
+                                                      yardstick::mae))
+    
+    # visualization for choosing hyperparameters
+    res %>%
+      collect_metrics() %>%
+      filter(.metric == "rsq") %>%
+      select(mean, min_n, mtry) %>%
+      pivot_longer(min_n:mtry,
+                   values_to = "value",
+                   names_to = "parameter"
+      ) %>%
+      ggplot(aes(value, mean, color = parameter)) +
+      geom_point(show.legend = FALSE) +
+      facet_wrap(~parameter, scales = "free_x") +
+      labs(x = NULL, y = "R Squared") -> gg_plot
+    
+    return(gg_plot)
+    
+  }
+  
+}
+```
+
+```{r}
+# model for assessing homes market value
+doParallel::registerDoParallel(4)
+
+plot_homes <- ml_fun(df = df_homes, folds_n = 10)
+plot_rentals <- ml_fun(df = df_rentals, folds_n = 10)
+
+plot_homes_rentals <- ml_fun(df = df_homes %>%
+                               dplyr::select(-year_built), folds_n = 10)
+plot_rentals_homes <- ml_fun(df = df_rentals %>%
+                               dplyr::select(-furnished), folds_n = 10)
+
+
+homes_rf <- ml_fun(df = df_homes, folds_n = 10, 
+                   mtry = c(20, 45), min_n = c(1, 15))
+saveRDS(homes_rf, "ml-models-data/homes_rf.rds")
+
+rentals_rf <- ml_fun(df = df_rentals, folds_n = 10, 
+                     mtry = c(20, 40), min_n = c(10, 20))
+saveRDS(rentals_rf, "ml-models-data/rentals_rf.rds")
+
+# model for predicting the housing price for rental properties
+homes_rentals_rf <- ml_fun(df = df_homes %>%
+                             dplyr::select(-year_built), 
+                           folds_n = 10, mtry = c(5, 45), min_n = c(1, 10))
+saveRDS(homes_rentals_rf, "ml-models-data/homes_rentals_rf.rds")
+
+# model for predicting the rental price for housing properties
+rentals_homes_rf <- ml_fun(df = df_rentals %>%
+                             dplyr::select(-furnished), folds_n = 10, 
+                           mtry = c(20, 30), min_n = c(10, 20))
+saveRDS(rentals_homes_rf, "ml-models-data/rentals_homes_rf.rds")
+```
+
+### Predictions + Price to Rent Ratios
+
+```{r}
+homes_rf <- readRDS("ml-models-data/homes_rf.rds")
+rentals_rf <- readRDS("ml-models-data/rentals_rf.rds")
+homes_rentals_rf <- readRDS("ml-models-data/homes_rentals_rf.rds")
+rentals_homes_rf <- readRDS("ml-models-data/rentals_homes_rf.rds")
+
+# predict house prices for rental data using housing random forest 
+homes_rentals_rf %>%
+  stats::predict(df_rentals %>%
+            dplyr::filter(!(type %in% c("room", "loft", "basement")))) %>%
+  
+  # price to the power because of previous transformation
+  dplyr::mutate(.pred = .pred^2) %>%
+  dplyr::pull() -> pred_homes
+
+
+housing_type <- df_rentals$type
+preds_price <- vector(mode = "double", length = length(nrow(df_rentals)))
+counter <- 0
+for(i in 1:nrow(df_rentals)) {
+  
+  print(i)
+  if(housing_type[[i]] %in% c("room", "loft", "basement")) {
+    
+    df_rentals[i, "pred_homes"] <- NA
+    
+  } else {
+    
+    counter <- counter + 1
+    df_rentals[i, "pred_homes"] = pred_homes[[counter]]
+    
+  }
+  
+}
+
+# predict rental prices for housing data using rental random forest
+rentals_homes_rf %>%
+  stats::predict(df_homes) %>%
+  dplyr::rename("pred_rentals" = .pred) %>%
+  dplyr::bind_cols(df_homes, .) %>%
+  
+  # transform back
+  dplyr::mutate(price = price^2) -> df_homes
+#----------------------------------------------------------------------
+#----------------------------------------------------------------------
+#----------------------------------------------------------------------
+
+# market value homes
+homes_rf %>%
+  stats::predict(df_homes) %>%
+  dplyr::rename("pred_homes" = .pred) %>%
+  dplyr::mutate(pred_homes = pred_homes^2) %>%
+  dplyr::bind_cols(df_homes, .) -> df_homes
+
+rentals_rf %>%
+  stats::predict(df_rentals) %>%
+  dplyr::rename("pred_rentals" = .pred) %>%
+  dplyr::bind_cols(df_rentals, .) -> df_rentals
+#----------------------------------------------------------------------
+#----------------------------------------------------------------------
+#----------------------------------------------------------------------
+
+# price to rent ratios
+df_homes %>%
+  dplyr::mutate(price_to_rent = price / (12 * pred_rentals)) %>% 
+  dplyr::mutate(above_mvalue = ifelse(pred_homes < price, "above", "below")) -> df_homes
+
+df_rentals %>%
+  dplyr::mutate(price_to_rent = pred_homes / (12 * price)) %>%
+  dplyr::mutate(above_mvalue = ifelse(pred_rentals < price, "above", "below")) -> df_rentals
+
+df_homes %>%
+  dplyr::bind_cols(df_homes_anno) %>%
+  dplyr::bind_rows(df_rentals %>%
+                     dplyr::bind_cols(df_rentals_anno)) -> df
+
+df <- dplyr::bind_rows(
+  df_homes %>%
+    dplyr::mutate(website = "buying"),
+  df_rentals %>%
+    dplyr::mutate(website = "rental")
+) %>%
+  dplyr::mutate(
+    date = Sys.Date(),
+    price_to_rent = round(price_to_rent, 1)
+  )
+
+df %>%
+  dplyr::mutate(
+    market_rate = ifelse(website == "buying",
+      "Market Rate Purchase:",
+      "Market Rate Rental:"
+    ),
+    rate = ifelse(website == "buying",
+      round(pred_homes) %>%
+        scales::dollar(),
+      round(pred_rentals) %>%
+        scales::dollar()
+    ),
+    what = ifelse(website == "buying",
+      "Predicted Rental Income:",
+      "Predicted Home Purchase:"
+    ),
+    predicted = ifelse(website == "buying",
+      round(pred_rentals) %>%
+        scales::dollar(),
+      round(pred_homes) %>%
+        scales::dollar()
+    )
+  ) -> df
+
+readr::write_csv(df, "data/final_data/df.csv")
+```

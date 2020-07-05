@@ -1,0 +1,91 @@
+---
+title: "EDA"
+author: "Pascal Schmidt"
+date: "May 14, 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+```
+
+```{r}
+df <- readr::read_csv("final.csv") %>%
+  dplyr::mutate(website = ifelse(data %in% c("craigslist", "liv_rent", "rentals", "fast_rental"),
+                                 "rental", "buying"))
+
+df %>% 
+  dplyr::mutate(furnished = ifelse(
+    stringr::str_detect(furnished,
+                        "(\\bfurnish\\b|\\bfurnished\\b|\\bbedroomfurnishedprivate\\b|
+                        \\bbedroomunfurnish\\b|\\bbedroomfurnish\\b)"), 
+    "furnished", furnished)
+  ) %>%
+  dplyr::mutate(furnished = ifelse(
+    stringr::str_detect(furnished,
+                        "unfurnished|bedroom"), 
+    "unfurnished", furnished)
+  ) -> df
+```
+
+```{r}
+# split into rentals and buying
+df_rentals <- df %>%
+  dplyr::filter(website == "rental") %>%
+  dplyr::select(-c(ID, postal_code, strata, taxes, data, description, year_built,
+                   lot_size, website, geometry, mapid, address, neighborhood)) %>%
+  na.omit()
+
+df_homes <- df %>%
+  dplyr::filter(website == "buying") %>%
+  dplyr::select(-c(ID, postal_code, strata, data, lot_size, website, taxes, 
+                   geometry, mapid, address, neighborhood, description, furnished)) %>%
+  na.omit() 
+```
+
+### Buying Homes
+
+- Look at unrealistic values for variables in the data frame and remove them.
+
+```{r}
+# check for weird outliers in data frame
+df_homes %>%
+  purrr::map_dfr(~ range(.))
+
+# removes houses with missing (unrealistic) year_built values
+df_homes <- df_homes[which(df_homes$year_built < 2030), ]
+
+# remove houses that cost more than 10 million
+df_homes <- df_homes[which(df_homes$price < 10000001), ]
+
+# remove square feet that are too low 
+df_homes <- df_homes[which(df_homes$sqft > 100), ]
+
+df_homes %>%
+  dplyr::mutate(price = sqrt(price)) -> df_homes
+```
+
+### Renting Homes
+
+```{r}
+# check for weird outliers in data frame
+df_rentals %>%
+  purrr::map_dfr(~ range(.))
+
+# removes houses with missing (unrealistic) year_built values
+df_rentals <- df_rentals[which(df_rentals$bed < 10), ]
+
+# remove houses that cost more than 10 million
+df_rentals <- df_rentals[which(df_rentals$price > 600), ] 
+
+# remove square feet that are too low 
+df_rentals <- df_rentals[which(df_rentals$sqft > 300), ] 
+
+# check for weird outliers in data frame
+df_rentals %>%
+  purrr::map_dfr(~ range(.))
+```

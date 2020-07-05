@@ -1,0 +1,254 @@
+---
+title: "EDA"
+author: "Pascal Schmidt"
+date: "May 14, 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(textstem)
+library(tidytext)
+library(tm)
+library(tidymodels)
+library(ranger)
+```
+
+```{r}
+df <- readr::read_csv("final.csv") %>% 
+  dplyr::mutate(website = ifelse(website %in% c("craigslist", "liv_rent", "rentals", "fast_rental"),
+                                 "rental", "buying"))
+```
+
+```{r}
+# split into rentals and buying
+df_rentals <- df %>%
+  dplyr::filter(website == "rental") %>% 
+  dplyr::select(-c(ID, postal_code, strata, taxes, data, year_built, date, description,
+                   lot_size, geometry, mapid, address, neighborhood, ID1, website, url)) %>%
+  na.omit() %>%
+  dplyr::mutate(type = dplyr::case_when(type == "studio" ~ "condo",
+                                        type == "apartment" ~ "condo",
+                                        type == "multi" ~ "house",
+                                        type == "multifamily" ~ "house",
+                                        TRUE ~ as.character(type))) %>%
+  dplyr::filter(type != "open house dates" & type != "partial house" & type != "land/lot")
+
+df_homes <- df %>%
+  dplyr::filter(website == "buying") %>%
+  dplyr::select(-c(ID, postal_code, strata, data, lot_size, website, taxes, date, ID1, url,
+                   geometry, mapid, address, neighborhood, description, furnished)) %>% 
+  na.omit() %>%
+  dplyr::mutate(type = dplyr::case_when(type == "studio" ~ "condo",
+                                        type == "multi" ~ "house",
+                                        type == "multifamily" ~ "house",
+                                        TRUE ~ as.character(type))) %>%
+  dplyr::filter(type != "open house dates" & type != "partial house" & type != "land/lot")
+```
+
+### Buying Homes
+
+- Look at unrealistic values for variables in the data frame and remove them.
+
+```{r}
+# check for weird outliers in data frame
+df_homes %>%
+  purrr::map_dfr(~ range(.))
+
+# removes houses with missing (unrealistic) year_built values
+df_homes <- df_homes[which(df_homes$year_built < 2030), ]
+
+# remove houses that cost more than 10 million
+df_homes <- df_homes[which(df_homes$price < 10000001), ]
+
+# remove square feet that are too low 
+df_homes <- df_homes[which(df_homes$sqft > 100), ]
+
+df_homes %>%
+  dplyr::mutate(price = sqrt(price)) -> df_homes
+```
+
+### Renting Homes
+
+```{r}
+# check for weird outliers in data frame
+df_rentals %>%
+  purrr::map_dfr(~ range(.))
+
+# removes houses with missing (unrealistic) year_built values
+df_rentals <- df_rentals[which(df_rentals$bed < 10), ]
+
+# remove houses that cost more than 10 million
+df_rentals <- df_rentals[which(df_rentals$price > 300), ] 
+
+# remove square feet that are too low 
+df_rentals <- df_rentals[which(df_rentals$sqft > 50), ] 
+
+# check for weird outliers in data frame
+df_rentals %>%
+  purrr::map_dfr(~ range(.))
+```
+
+```{r}
+df_rentals %>%
+  dplyr::mutate(ID = dplyr::row_number()) %>%
+  dplyr::select(description, ID) %>%
+  dplyr::mutate(description = stringr::str_to_lower(description) %>%
+                  textstem::lemmatize_words()) %>%
+  tidytext::unnest_tokens(words, description) %>%
+  dplyr::filter(!words %in% tidytext::stop_words$word) %>%
+  dplyr::count(ID, words, sort = TRUE) %>%
+  dplyr::group_by(ID) %>%
+  dplyr::mutate(total = sum(n)) %>%
+  dplyr::ungroup() %>%
+  dplyr::group_by(words) %>%
+  dplyr::mutate(nn = n(),
+                prop = nn / nrow(df_rentals)) %>%
+  dplyr::filter(prop >= 0.01 & prop <= 0.1) %>%
+  dplyr::distinct(words) %>%
+  dplyr::filter(stringr::str_detect(words, "[0-9]+", negate = TRUE)) %>%
+  dplyr::filter(nchar(words) >= 4) -> text_preds
+
+remove_words <- c("https", "bldg", "covid", "sqft", "bdrms",
+                  "only.read", "included.read", "moreview",
+                  "baths", "bdrm", "bath", "feet", "square",
+                  "sq.ft", "beds", "you’ll", "uniqueaccommodations.com",
+                  "rentitfurnished.com", "it’s", "http", "below:https",
+                  "change.a", "january", "february", "march", "april", 
+                  "may", "june", "july", "september", "october", "listing.to", 
+                  "november", "december", "note:all", "property.to", "link:http",
+                  "www.uniqueaccomm", "www.uniqueaccomm", "change.to", "furnishedsq",
+                  "craigslist.rental", "craigslist.professional", "ft.yaletown",
+                  "ft.downtown")
+text_preds %>%
+  dplyr::filter(!words %in% remove_words) -> text_preds
+```
+
+```{r}
+df_rentals %>%
+  dplyr::mutate(ID = dplyr::row_number()) %>%
+  dplyr::select(description, ID) %>%
+  dplyr::mutate(description = stringr::str_to_lower(description) %>%
+                  textstem::lemmatize_words()) %>%
+  tidytext::unnest_tokens(words, description) %>%
+  dplyr::filter(!words %in% tidytext::stop_words$word) %>%
+  dplyr::count(ID, words, sort = TRUE) %>%
+  dplyr::group_by(ID) %>%
+  dplyr::mutate(total = sum(n)) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(ID, words, n) %>%
+  tidyr::pivot_wider(names_from = words, values_from = n, 
+                     values_fill = list(n = 0)) -> text_df
+
+text_df %>%
+  dplyr::select(c("ID", col_names %>%
+                    dplyr::pull())) %>%
+  dplyr::arrange(ID) -> text_df
+
+df_rentals %>%
+  dplyr::select(price) %>%
+  dplyr::bind_cols(text_df) -> text_df
+
+df_rentals %>%
+  dplyr::select(-description) -> df_rentals
+```
+
+
+```{r}
+library(tidymodels)
+
+text_df %>%
+  dplyr::select(-ID) -> text_df
+
+set.seed(123)
+split <- rsample::initial_split(text_df)
+train <- rsample::training(split)
+test <- rsample::testing(split)
+folds <- rsample::vfold_cv(train, v = 10)
+
+recipes::recipe(price ~ ., data = train) %>%
+  # recipes::step_dummy(recipes::all_nominal()) %>%
+  recipes::step_zv(all_numeric(), -all_outcomes()) %>%
+  recipes::step_normalize(all_numeric(), -all_outcomes()) -> rec
+
+tune_spec <- parsnip::linear_reg(penalty = tune::tune(), mixture = 1) %>%
+  parsnip::set_engine("glmnet")
+
+lambda_grid <- dials::grid_regular(dials::penalty(), levels = 50)
+
+## Construct a workflow that combines your recipe and your model
+ml_wflow <-
+  workflows::workflow() %>%
+  workflows::add_recipe(rec) %>%
+  workflows::add_model(tune_spec)
+
+doParallel::registerDoParallel(4)
+res <-
+  ml_wflow %>%
+  tune::tune_grid(resamples = folds,
+                  grid = lambda_grid,
+                  metrics = yardstick::metric_set(yardstick::rmse,
+                                                  yardstick::rsq))
+highest_rsq <- res %>%
+  tune::collect_metrics() %>%
+  dplyr::filter(.metric == "rsq") %>%
+  dplyr::arrange(desc(mean)) %>%
+  .[1, 1]
+
+final_lasso <- ml_wflow %>%
+  finalize_workflow(
+  highest_rsq
+)
+
+library(vip)
+tune_spec <- parsnip::linear_reg(penalty = tune::tune(), mixture = 1) %>%
+  parsnip::set_engine("glmnet")
+
+texts <- list()
+for(i in seq_along(folds$splits)) {
+  
+  df_train <- rsample::training(folds$splits[[i]])
+  
+  final_lasso %>%
+    fit(df_train) %>%
+    pull_workflow_fit() %>%
+    vi(lambda = highest_rsq$penalty) %>%
+    mutate(Importance = abs(Importance)) %>%
+    dplyr::arrange(desc(Importance)) %>%
+    dplyr::pull(Variable) %>%
+    .[1:100] -> texts[[i]]
+  
+}
+
+texts %>%
+  purrr::flatten_chr() %>%
+  table() %>%
+  .[. >= 5] %>%
+  names() -> col_names
+
+col_names <- as_tibble(col_names)
+
+readr::write_csv(col_names, "vars_rf_rental.csv")
+
+last_fit(
+  final_lasso,
+  split
+) %>%
+  collect_metrics()
+
+text_df %>%
+  dplyr::select(-price) %>%
+  dplyr::select(col_names) -> text_cols
+
+df_rentals %>%
+  dplyr::select(-description) %>%
+  cbind(text_cols) %>%
+  dplyr::as_tibble() -> df_rentals
+
+View(df_rentals)
+```
+
